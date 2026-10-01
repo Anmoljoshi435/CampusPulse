@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS users (
   section VARCHAR(20),
   department VARCHAR(100),
   phone VARCHAR(25),
+  email_verified_at DATETIME NULL,
+  phone_verified_at DATETIME NULL,
   college_id INT,
   approval_status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
   role ENUM('student','admin') NOT NULL DEFAULT 'student',

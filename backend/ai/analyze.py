@@ -39,6 +39,9 @@ def classify(text):
 
 
 def similarity_scores(text, existing):
+    if not existing:
+        return []
+
     documents = [text] + [
         f"{item.get('title', '')} {item.get('description', '')}"
         for item in existing
@@ -124,7 +127,11 @@ def summary_analysis(data):
 
 
 def main():
-    data = json.loads(sys.stdin.read())
+    try:
+        data = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, TypeError):
+        print(json.dumps({'error': 'Invalid AI input'}))
+        raise SystemExit(2)
     if data.get('mode') == 'trends':
         result = trend_analysis(data)
     elif data.get('mode') == 'summaries':

@@ -1,15 +1,18 @@
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
+import rateLimit from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { Server } from 'socket.io'
-import 'dotenv/config'
 import { pool } from './db.js'
+import { config } from './config.js'
+import { otpService } from './services/otpService.js'
 
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+if (!config.jwtSecret || config.jwtSecret.length < 32) {
   throw new Error('JWT_SECRET must be at least 32 characters long')
 }
 
@@ -19,22 +22,53 @@ const httpServer = createServer(app)
 
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173'
+    origin: config.corsOrigins,
+    credentials: true
   }
 })
 
+const sessionCookie = 'campuspulse_session'
+const parseCookies = header => Object.fromEntries((header || '').split(';').map(item => item.trim().split('=').map(decodeURIComponent)).filter(item => item.length === 2))
+const hashToken = token => createHash('sha256').update(token).digest('hex')
+const cookieOptions = [`${sessionCookie}=`, 'Max-Age=0', 'Path=/', 'HttpOnly', 'SameSite=Lax', config.nodeEnv === 'production' ? 'Secure' : ''].filter(Boolean).join('; ')
+
+const createSession = async user => {
+  const sessionId = randomUUID()
+  const token = jwt.sign({ id: user.id, role: user.role, name: user.name, collegeId: user.college_id, sessionId }, config.jwtSecret, { expiresIn: '7d' })
+  await pool.query(
+    'INSERT INTO auth_sessions(id,user_id,token_hash,expires_at) VALUES (?,?,?,DATE_ADD(NOW(), INTERVAL 7 DAY))',
+    [sessionId, user.id, hashToken(token)]
+  )
+  return token
+}
+
+const setSessionCookie = (res, token) => {
+  const parts = [`${sessionCookie}=${encodeURIComponent(token)}`, 'Path=/', 'HttpOnly', 'SameSite=Lax']
+  if (config.nodeEnv === 'production') parts.push('Secure')
+  res.setHeader('Set-Cookie', parts.join('; '))
+}
+
 io.use(async (socket, next) => {
   try {
-    const token = socket.handshake.auth?.token
-    const user = jwt.verify(token || '', process.env.JWT_SECRET)
+    const token = socket.handshake.auth?.token || parseCookies(socket.handshake.headers.cookie)[sessionCookie]
+    const user = jwt.verify(token || '', config.jwtSecret)
+    const [[session]] = await pool.query(
+      'SELECT id FROM auth_sessions WHERE id=? AND user_id=? AND token_hash=? AND revoked_at IS NULL AND expires_at>NOW()',
+      [user.sessionId, user.id, hashToken(token)]
+    )
+    if (!session) return next(new Error('Authentication required'))
     const [[account]] = await pool.query(
-      'SELECT college_id FROM users WHERE id=? AND college_id IS NOT NULL',
+      'SELECT id,role,college_id,approval_status FROM users WHERE id=? AND college_id IS NOT NULL',
       [user.id]
     )
 
-    if (!account) return next(new Error('Authenticated college required'))
+    if (!account || (account.role === 'student' && account.approval_status !== 'approved')) return next(new Error('Authenticated college required'))
 
     socket.data.collegeId = account.college_id
+    socket.data.userId = account.id
+    socket.data.role = account.role
+    socket.join(`user:${account.id}`)
+    if (account.role === 'admin') socket.join(`admins:${account.college_id}`)
     next()
   } catch {
     next(new Error('Authentication required'))
@@ -47,62 +81,26 @@ io.on('connection', socket => {
 
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:5173'
+    origin: config.corsOrigins,
+    credentials: true
   })
 )
 
+app.use(helmet())
 app.use(express.json({ limit: '100kb' }))
 
-const authAttempts = new Map()
-const authRateLimit = (req, res, next) => {
-  const key = req.ip || req.socket.remoteAddress || 'unknown'
-  const now = Date.now()
-  const recent = (authAttempts.get(key) || []).filter(
-    timestamp => now - timestamp < 60_000
-  )
+const authRateLimit = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Try again shortly.' }
+})
 
-  if (recent.length >= 10) {
-    res.set('Retry-After', '60')
-    return res.status(429).json({
-      error: 'Too many authentication attempts. Try again shortly.'
-    })
-  }
-
-  recent.push(now)
-  authAttempts.set(key, recent)
-  next()
-}
-
-const prepareDatabase = async () => {
-  for (const statement of [
-    'CREATE TABLE IF NOT EXISTS colleges (id INT AUTO_INCREMENT PRIMARY KEY,college_code VARCHAR(30) NOT NULL UNIQUE,name VARCHAR(180) NOT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)',
-    'ALTER TABLE users ADD COLUMN usn VARCHAR(40) UNIQUE',
-    'ALTER TABLE users ADD COLUMN semester TINYINT UNSIGNED',
-    'ALTER TABLE users ADD COLUMN section VARCHAR(20)',
-    'ALTER TABLE users ADD COLUMN department VARCHAR(100)',
-    'ALTER TABLE users ADD COLUMN phone VARCHAR(25)',
-    'ALTER TABLE users ADD COLUMN college_id INT',
-    'ALTER TABLE users ADD COLUMN approval_status ENUM(\'pending\',\'approved\',\'rejected\') NOT NULL DEFAULT \'approved\'',
-    'ALTER TABLE complaints ADD COLUMN college_id INT',
-    'ALTER TABLE complaints ADD COLUMN department VARCHAR(100)',
-    'ALTER TABLE notifications ADD COLUMN college_id INT',
-    'CREATE TABLE IF NOT EXISTS membership_requests (id INT AUTO_INCREMENT PRIMARY KEY,user_id INT NOT NULL,college_id INT NOT NULL,status ENUM(\'pending\',\'approved\',\'rejected\') NOT NULL DEFAULT \'pending\',reviewed_by INT,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,reviewed_at TIMESTAMP NULL)',
-    'CREATE TABLE IF NOT EXISTS departments (id INT AUTO_INCREMENT PRIMARY KEY,college_id INT NOT NULL,name VARCHAR(100) NOT NULL,is_active BOOLEAN DEFAULT TRUE,UNIQUE KEY college_department(college_id,name))',
-    'CREATE TABLE IF NOT EXISTS complaint_assignments (complaint_id INT PRIMARY KEY,department_id INT,staff_id INT,internal_note TEXT)',
-    'UPDATE complaints c JOIN users u ON u.id=c.user_id SET c.college_id=u.college_id WHERE c.college_id IS NULL'
-  ]) {
-    try {
-      await pool.query(statement)
-    } catch (error) {
-      if (
-        !error.message.includes('Duplicate column') &&
-        !error.message.includes('already exists')
-      ) {
-        console.error('Database migration warning:', error.message)
-      }
-    }
-  }
-}
+const validEmail = value => typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+const validPhone = value => typeof value === 'string' && /^\+[1-9]\d{7,14}$/.test(value)
+const validOtpChannel = value => value === 'email'
+const validOtpPurpose = value => ['registration_email', 'password_reset', 'admin_2fa'].includes(value)
 
 const generateCollegeCode = async () => {
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -121,29 +119,35 @@ const generateCollegeCode = async () => {
   throw new Error('Could not generate a unique college ID')
 }
 
-const sign = user =>
-  jwt.sign(
-    {
-      id: user.id,
-      role: user.role,
-      name: user.name,
-      collegeId: user.college_id
-    },
-    process.env.JWT_SECRET,
-    {
-      expiresIn: '7d'
-    }
+const createNotification = async ({ userId, collegeId, complaintId = null, message }) => {
+  await pool.query(
+    'INSERT INTO notifications(user_id,college_id,complaint_id,message) VALUES (?,?,?,?)',
+    [userId, collegeId, complaintId, message]
   )
+  io.to(`user:${userId}`).emit('notificationCreated', { message, complaintId, collegeId })
+}
 
-const auth = (req, res, next) => {
+const auth = async (req, res, next) => {
   try {
-    req.user = jwt.verify(
-      (req.headers.authorization || '')
-        .replace('Bearer ', '')
-        .trim(),
-      process.env.JWT_SECRET
+    const cookies = parseCookies(req.headers.cookie)
+    const token = cookies[sessionCookie] || (req.headers.authorization || '').replace('Bearer ', '').trim()
+    const claims = jwt.verify(
+      token,
+      config.jwtSecret
     )
-
+    const [[session]] = await pool.query(
+      'SELECT id FROM auth_sessions WHERE id=? AND user_id=? AND token_hash=? AND revoked_at IS NULL AND expires_at>NOW()',
+      [claims.sessionId, claims.id, hashToken(token)]
+    )
+    if (!session) return res.status(401).json({ error: 'Authentication required' })
+    const [[account]] = await pool.query(
+      'SELECT id,role,college_id,approval_status FROM users WHERE id=?',
+      [claims.id]
+    )
+    if (!account || !account.college_id || (account.role === 'student' && account.approval_status !== 'approved')) {
+      return res.status(401).json({ error: 'Authentication required' })
+    }
+    req.user = { ...claims, role: account.role, collegeId: account.college_id, college_id: account.college_id }
     next()
   } catch {
     res.status(401).json({
@@ -180,37 +184,73 @@ const admin = async (req, res, next) => {
   }
 }
 
-const analyze = payload =>
+const analyzeLocal = payload =>
   new Promise((resolve, reject) => {
     const child = spawn(
-      process.env.PYTHON_BIN || 'python',
+      config.pythonBin,
       ['ai/analyze.py']
     )
 
     let output = ''
+    const timeout = setTimeout(() => {
+      child.kill()
+      reject(new Error('AI service timed out'))
+    }, 5000)
 
     child.stdout.on('data', chunk => {
       output += chunk
     })
 
     child.on('close', code => {
+      clearTimeout(timeout)
       if (code) {
         reject(new Error('AI service failed'))
       } else {
-        resolve(JSON.parse(output))
+        try {
+          const result = JSON.parse(output)
+          if (result.error) reject(new Error(result.error))
+          else resolve(result)
+        } catch {
+          reject(new Error('AI service returned malformed output'))
+        }
       }
     })
 
     child.stdin.end(JSON.stringify(payload))
   })
 
+const analyze = async payload => {
+  if (config.aiServiceUrl) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    try {
+      const response = await fetch(`${config.aiServiceUrl.replace(/\/+$/, '')}/ai/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      })
+      if (!response.ok) throw new Error('AI service returned an error')
+      return await response.json()
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return analyzeLocal(payload)
+}
+
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1')
-
     res.json({
       ok: true,
-      database: 'connected'
+      services: {
+        api: 'healthy',
+        database: 'connected',
+        ai: config.aiServiceUrl ? 'configured' : 'local',
+        email: process.env.SMTP_HOST ? 'configured' : 'not_configured',
+        sms: 'disabled'
+      }
     })
   } catch (error) {
     res.status(503).json({
@@ -221,90 +261,156 @@ app.get('/api/health', async (req, res) => {
   }
 })
 
-app.post('/api/auth/register', authRateLimit, async (req, res) => {
-  try {
-    const {
-      name,
-      email,
-      password,
-      usn,
-      semester,
-      section,
-      department,
-      phone,
-      collegeId,
-      collegePassword
-    } = req.body
-
-    if (
-      !name ||
-      !email ||
-      !password ||
-      password.length < 6 ||
-      !usn ||
-      !semester ||
-      !section ||
-      !department
-    ) {
-      return res.status(400).json({
-        error:
-          'Name, email, password, USN, semester, section and department are required'
-      })
-    }
-
-    const [colleges] = await pool.query(
-      'SELECT id FROM colleges WHERE college_code=?',
-      [collegeId]
-    )
-
-    if (
-      !colleges[0] ||
-      collegePassword !== process.env.COLLEGE_PASSWORD
-    ) {
-      return res.status(403).json({
-        error: 'Invalid college code or college password'
-      })
-    }
-
-    const hash = await bcrypt.hash(password, 10)
-
-    const [result] = await pool.query(
-      'INSERT INTO users(name,email,password_hash,usn,semester,section,department,phone,college_id,approval_status) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      [
-        name,
-        email,
-        hash,
-        usn,
-        semester,
-        section,
-        department,
-        phone || null,
-        colleges[0].id,
-        'pending'
-      ]
-    )
-
-    await pool.query(
-      'INSERT INTO membership_requests(user_id,college_id) VALUES (?,?)',
-      [result.insertId, colleges[0].id]
-    )
-
-    res.status(201).json({
-      message: 'Request sent to your college admin for approval'
-    })
-  } catch (error) {
-    if (error.code === 'ECONNREFUSED' || error.fatal) {
-      return res.status(503).json({
-        error: 'Database unavailable. Start MySQL and try again.'
-      })
-    }
-
-    res.status(400).json({
-      error: error.code === 'ER_DUP_ENTRY'
-        ? 'Email or USN already registered'
-        : 'Registration failed'
-    })
+app.post('/api/auth/request-otp', authRateLimit, async (req, res) => {
+  const { email, channel, purpose } = req.body
+  if (!validOtpChannel(channel) || !validOtpPurpose(purpose) ||
+      !validEmail(email)) {
+    return res.status(400).json({ error: 'A valid OTP destination, channel and purpose are required' })
   }
+  try {
+    const result = await otpService.issue({ email, channel, purpose })
+    res.status(202).json({ ok: true, ...result })
+  } catch (error) {
+    if (error.code === 'OTP_COOLDOWN') {
+      res.set('Retry-After', String(error.retryAfter))
+      return res.status(429).json({ error: error.message })
+    }
+    console.error('OTP request failed:', error.message)
+    res.status(503).json({ error: 'Verification delivery is unavailable' })
+  }
+})
+
+app.post('/api/auth/resend-otp', authRateLimit, async (req, res) => {
+  const { email, channel, purpose } = req.body
+  if (!validEmail(email) || !validOtpChannel(channel) || !validOtpPurpose(purpose)) {
+    return res.status(400).json({ error: 'A valid OTP channel and purpose are required' })
+  }
+  try {
+    const result = await otpService.issue({ email, channel, purpose })
+    res.status(202).json({ ok: true, ...result })
+  } catch (error) {
+    if (error.code === 'OTP_COOLDOWN') {
+      res.set('Retry-After', String(error.retryAfter))
+      return res.status(429).json({ error: error.message })
+    }
+    console.error('OTP resend failed:', error.message)
+    res.status(503).json({ error: 'Verification delivery is unavailable' })
+  }
+})
+
+app.post('/api/auth/verify-otp', authRateLimit, async (req, res) => {
+  const { email, channel, purpose, code } = req.body
+  if (!validEmail(email) || !validOtpChannel(channel) || !validOtpPurpose(purpose) || !/^\d{6}$/.test(String(code || ''))) {
+    return res.status(400).json({ error: 'A valid verification code is required' })
+  }
+  try {
+    await otpService.verify({ email, channel, purpose, code })
+    res.json({ ok: true })
+  } catch (error) {
+    res.status(400).json({ error: error.message })
+  }
+})
+
+app.post('/api/auth/forgot-password', authRateLimit, async (req, res) => {
+  const { email } = req.body
+  const destination = validEmail(email) ? { email, channel: 'email' } : null
+  if (destination) {
+    try {
+      const [[user]] = await pool.query('SELECT id FROM users WHERE email=? LIMIT 1', [email])
+      if (user) await otpService.issue({ ...destination, purpose: 'password_reset', userId: user.id })
+    } catch (error) {
+      if (error.code !== 'OTP_COOLDOWN') console.error('Password reset request failed:', error.message)
+    }
+  }
+  res.status(200).json({ message: 'If the account exists, a verification code has been sent.' })
+})
+
+app.post('/api/auth/reset-password', authRateLimit, async (req, res) => {
+  const { email, channel, code, newPassword } = req.body
+  if (!validEmail(email) || !validOtpChannel(channel) ||
+      typeof newPassword !== 'string' || newPassword.length < 10 ||
+      !/^\d{6}$/.test(String(code || ''))) {
+    return res.status(400).json({ error: 'Invalid password reset request' })
+  }
+  try {
+    await otpService.verify({ email, channel, purpose: 'password_reset', code })
+    const [result] = await pool.query(
+      'UPDATE users SET password_hash=? WHERE email=?',
+      [await bcrypt.hash(newPassword, 12), email]
+    )
+    if (!result.affectedRows) return res.status(400).json({ error: 'Invalid password reset request' })
+    res.json({ ok: true })
+  } catch (error) {
+    res.status(400).json({ error: error.message })
+  }
+})
+
+app.post('/api/auth/start-registration', authRateLimit, async (req, res) => {
+  const { name, email, password, usn, semester, section, department, collegeId } = req.body
+  if (!name || !validEmail(email) || typeof password !== 'string' || password.length < 10 ||
+      !usn || !Number.isInteger(Number(semester)) || !section || !department || !collegeId) {
+    return res.status(400).json({ error: 'Complete valid registration details are required' })
+  }
+  try {
+    const [[college]] = await pool.query('SELECT id FROM colleges WHERE college_code=?', [collegeId])
+    if (!college) return res.status(400).json({ error: 'Invalid college code' })
+    const attemptId = randomUUID()
+    await pool.query(
+      `INSERT INTO registration_attempts
+       (id,name,email,usn,semester,section,department,college_id,password_hash,expires_at)
+       VALUES (?,?,?,?,?,?,?,?,?,DATE_ADD(NOW(), INTERVAL 15 MINUTE))`,
+      [attemptId, name.trim(), email.toLowerCase(), usn.trim(), Number(semester), section.trim(), department.trim(), college.id, await bcrypt.hash(password, 12)]
+    )
+    await Promise.all([
+      otpService.issue({ email: email.toLowerCase(), channel: 'email', purpose: 'registration_email' })
+    ])
+    res.status(202).json({ registrationId: attemptId, message: 'Verification codes sent.' })
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Email or USN already registered' })
+    if (error.code === 'OTP_COOLDOWN') return res.status(429).json({ error: error.message })
+    console.error('Registration start failed:', error.message)
+    if (error.message === 'Email delivery is unavailable') {
+      return res.status(503).json({ error: 'Email verification is unavailable. Check the SMTP settings in backend/.env.' })
+    }
+    res.status(503).json({ error: 'Registration verification is unavailable' })
+  }
+})
+
+app.post('/api/auth/verify-registration', authRateLimit, async (req, res) => {
+  const { registrationId, email, emailCode } = req.body
+  if (!registrationId || !validEmail(email) || !/^\d{6}$/.test(String(emailCode || ''))) {
+    return res.status(400).json({ error: 'A valid email verification code is required' })
+  }
+  const connection = await pool.getConnection()
+  try {
+    await otpService.verify({ email: email.toLowerCase(), channel: 'email', purpose: 'registration_email', code: emailCode })
+    await connection.beginTransaction()
+    const [[attempt]] = await connection.query(
+      'SELECT * FROM registration_attempts WHERE id=? AND email=? AND expires_at>NOW() FOR UPDATE',
+      [registrationId, email.toLowerCase()]
+    )
+    if (!attempt) throw new Error('Registration request expired')
+    const [result] = await connection.query(
+      `INSERT INTO users(name,email,password_hash,usn,semester,section,department,phone,college_id,approval_status,email_verified_at,phone_verified_at)
+       VALUES (?,?,?,?,?,?,?,?,?,'pending',NOW(),NOW())`,
+      [attempt.name, attempt.email, attempt.password_hash, attempt.usn, attempt.semester, attempt.section, attempt.department, attempt.phone, attempt.college_id]
+    )
+    await connection.query('INSERT INTO membership_requests(user_id,college_id) VALUES (?,?)', [result.insertId, attempt.college_id])
+    await connection.query('DELETE FROM registration_attempts WHERE id=?', [registrationId])
+    await connection.commit()
+    res.status(201).json({ message: 'Registration verified. Your college admin must approve your account.' })
+  } catch (error) {
+    await connection.rollback()
+    res.status(400).json({ error: error.message })
+  } finally {
+    connection.release()
+  }
+})
+
+app.post('/api/auth/register', authRateLimit, async (req, res) => {
+  res.status(410).json({
+    error: 'Use email verification registration at /api/auth/start-registration'
+  })
 })
 
 app.post('/api/auth/create-college', authRateLimit, async (req, res) => {
@@ -393,10 +499,7 @@ app.post('/api/auth/login', authRateLimit, async (req, res) => {
         })
       }
 
-      if (
-        !(await bcrypt.compare(password, user.password_hash)) &&
-        password !== process.env.ADMIN_ACCESS_KEY
-      ) {
+      if (!(await bcrypt.compare(password, user.password_hash))) {
         return res.status(401).json({
           error: 'Invalid admin password'
         })
@@ -417,8 +520,9 @@ app.post('/api/auth/login', authRateLimit, async (req, res) => {
       }
     }
 
+    const token = await createSession(user)
+    setSessionCookie(res, token)
     res.json({
-      token: sign(user),
       role: user.role,
       user: {
         name: user.name,
@@ -429,6 +533,21 @@ app.post('/api/auth/login', authRateLimit, async (req, res) => {
         collegeName: user.college_name,
         collegeId: user.college_code
       }
+    })
+
+    app.get('/api/auth/session', auth, async (req, res) => {
+      const [[user]] = await pool.query(
+        'SELECT u.name,u.usn,u.semester,u.section,u.department,u.role,c.name college_name,c.college_code FROM users u LEFT JOIN colleges c ON c.id=u.college_id WHERE u.id=?',
+        [req.user.id]
+      )
+      res.json({ role: user.role, user: { name: user.name, usn: user.usn, semester: user.semester, section: user.section, department: user.department, collegeName: user.college_name, collegeId: user.college_code } })
+    })
+
+    app.post('/api/auth/logout', auth, async (req, res) => {
+      const token = parseCookies(req.headers.cookie)[sessionCookie]
+      if (token) await pool.query('UPDATE auth_sessions SET revoked_at=NOW() WHERE id=? AND user_id=?', [req.user.sessionId, req.user.id])
+      res.setHeader('Set-Cookie', cookieOptions)
+      res.json({ ok: true })
     })
   } catch (error) {
     res.status(500).json({
@@ -495,6 +614,29 @@ app.get('/api/admin/home', auth, admin, async (req, res) => {
       location
     },
     activity
+  })
+
+  app.get('/api/notifications', auth, async (req, res) => {
+    const [rows] = await pool.query(
+      `SELECT id,message,complaint_id,is_read,created_at
+       FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100`,
+      [req.user.id]
+    )
+    res.json(rows)
+  })
+
+  app.put('/api/notifications/:id/read', auth, async (req, res) => {
+    const [result] = await pool.query(
+      'UPDATE notifications SET is_read=TRUE WHERE id=? AND user_id=?',
+      [req.params.id, req.user.id]
+    )
+    if (!result.affectedRows) return res.status(404).json({ error: 'Notification not found' })
+    res.json({ ok: true })
+  })
+
+  app.put('/api/notifications/read-all', auth, async (req, res) => {
+    await pool.query('UPDATE notifications SET is_read=TRUE WHERE user_id=?', [req.user.id])
+    res.json({ ok: true })
   })
 })
 
@@ -657,8 +799,21 @@ app.put('/api/admin/issues/:id', auth, admin, async (req, res) => {
   )
 
   if (!result.affectedRows) {
-    return res.status(403).json({
+    return res.status(404).json({
       error: 'Issue does not belong to your college'
+    })
+  }
+
+  const [[complaint]] = await pool.query(
+    'SELECT user_id,title,status,priority FROM complaints WHERE id=? AND college_id=?',
+    [req.params.id, req.user.college_id]
+  )
+  if (complaint) {
+    await createNotification({
+      userId: complaint.user_id,
+      collegeId: req.user.college_id,
+      complaintId: req.params.id,
+      message: `Your issue "${complaint.title}" is now ${complaint.status}.`
     })
   }
 
@@ -788,6 +943,18 @@ app.put('/api/admin/requests/:id', auth, admin, async (req, res) => {
     collegeId: req.user.college_id
   })
 
+  const [[requestOwner]] = await pool.query(
+    `SELECT r.user_id FROM membership_requests r WHERE r.id=? AND r.college_id=?`,
+    [req.params.id, req.user.college_id]
+  )
+  if (requestOwner) {
+    await createNotification({
+      userId: requestOwner.user_id,
+      collegeId: req.user.college_id,
+      message: `Your membership request was ${next}.`
+    })
+  }
+
   res.json({
     ok: true
   })
@@ -839,11 +1006,19 @@ app.post('/api/complaints', auth, async (req, res) => {
       [req.user.id]
     )
 
-    const ai = await analyze({
-      title,
-      description,
-      existing
-    })
+    let ai = {
+      category: category || 'Other',
+      priority: 'Medium',
+      similar_count: 0,
+      matches: [],
+      duplicate: null,
+      unavailable: true
+    }
+    try {
+      ai = await analyze({ title, description, existing })
+    } catch (error) {
+      console.error('AI analysis unavailable:', error.message)
+    }
 
     const [[owner]] = await pool.query(
       'SELECT college_id FROM users WHERE id=?',
@@ -1007,21 +1182,17 @@ app.use((error, req, res, next) => {
   })
 })
 
-/*
- * PORT
- * Set to 5000 so the frontend can connect properly.
- */
-const port = Number(process.env.PORT || 5000)
+const shutdown = async signal => {
+  console.log(`Received ${signal}; shutting down`)
+  await new Promise(resolve => httpServer.close(resolve))
+  await io.close()
+  await pool.end()
+  process.exit(0)
+}
 
-prepareDatabase()
-  .then(() => {
-    httpServer.listen(port, () => {
-      console.log(
-        `CampusPulse API listening on http://localhost:${port}`
-      )
-    })
-  })
-  .catch(error => {
-    console.error('Failed to prepare database:', error)
-    process.exit(1)
-  })
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+
+httpServer.listen(config.port, () => {
+  console.log(`CampusPulse API listening on port ${config.port}`)
+})
