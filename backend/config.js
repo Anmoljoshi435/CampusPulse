@@ -10,8 +10,7 @@ const requiredInProduction = [
   'DB_USER',
   'DB_PASSWORD',
   'JWT_SECRET',
-  'PYTHON_BIN',
-  'AI_SERVICE_URL'
+  'PYTHON_BIN'
 ]
 
 if (isProduction) {
