@@ -1,0 +1,47 @@
+.auth-card form input,
+.auth-card form button {
+  box-sizing: border-box;
+}
+
+.auth-links {
+  position: relative;
+  z-index: 1;
+}
+
+.auth-links .auth-switch {
+  width: 100%;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+@media (max-width: 600px) {
+  .auth-screen {
+    min-height: 100dvh;
+    display: flex;
+    align-items: flex-start;
+    padding: 16px;
+  }
+
+  .auth-card {
+    width: 100%;
+    margin: auto 0;
+  }
+
+  .auth-logo {
+    margin-bottom: 30px;
+  }
+
+  .auth-card form {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .auth-card form label,
+  .auth-submit {
+    flex: none;
+  }
+
+  .auth-links {
+    margin-top: 20px;
+  }
+}
