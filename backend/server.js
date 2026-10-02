@@ -17,6 +17,7 @@ if (!config.jwtSecret || config.jwtSecret.length < 32) {
 }
 
 const app = express()
+app.set('trust proxy', 1)
 
 const httpServer = createServer(app)
 
@@ -312,7 +313,7 @@ app.post('/api/auth/verify-otp', authRateLimit, async (req, res) => {
 })
 
 app.post('/api/auth/forgot-password', authRateLimit, async (req, res) => {
-  const { email } = req.body
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
   const destination = validEmail(email) ? { email, channel: 'email' } : null
   if (destination) {
     try {
@@ -326,7 +327,8 @@ app.post('/api/auth/forgot-password', authRateLimit, async (req, res) => {
 })
 
 app.post('/api/auth/reset-password', authRateLimit, async (req, res) => {
-  const { email, channel, code, newPassword } = req.body
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+  const { channel, code, newPassword } = req.body
   if (!validEmail(email) || !validOtpChannel(channel) ||
       typeof newPassword !== 'string' || newPassword.length < 10 ||
       !/^\d{6}$/.test(String(code || ''))) {

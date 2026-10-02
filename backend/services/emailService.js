@@ -11,6 +11,10 @@ const sendEmail = async ({ to, subject, text, html }) => {
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: process.env.SMTP_SECURE === 'true',
+    family: 4,
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASSWORD
