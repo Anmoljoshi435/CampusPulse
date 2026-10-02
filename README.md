@@ -2,6 +2,12 @@
 
 CampusPulse is a React/Vite frontend backed by an Express, MySQL, and Socket.IO API. Complaint classification and similarity analysis run through the Python AI service.
 
+## Deployed application
+
+- Frontend: https://campus-pulse-h1hfvjeah-anmoljoshi435.vercel.app
+- API: https://campuspulse-api-tkh3.onrender.com
+- API health: https://campuspulse-api-tkh3.onrender.com/api/health
+
 ## Architecture
 
 - `frontend/` - responsive React application
