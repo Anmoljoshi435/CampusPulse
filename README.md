@@ -4,7 +4,7 @@ CampusPulse is a React/Vite frontend backed by an Express, MySQL, and Socket.IO 
 
 ## Deployed application
 
-- Frontend: https://campus-pulse-h1hfvjeah-anmoljoshi435.vercel.app
+- Frontend: https://campus-pulse-roan.vercel.app
 - API: https://campuspulse-api-tkh3.onrender.com
 - API health: https://campuspulse-api-tkh3.onrender.com/api/health
 
