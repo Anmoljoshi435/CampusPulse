@@ -251,7 +251,7 @@ app.get('/api/health', async (req, res) => {
         api: 'healthy',
         database: 'connected',
         ai: config.aiServiceUrl ? 'configured' : 'local',
-        email: process.env.SMTP_HOST ? 'configured' : 'not_configured',
+        email: process.env.RESEND_API_KEY ? 'configured' : 'not_configured',
         sms: 'disabled'
       }
     })

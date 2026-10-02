@@ -1,32 +1,25 @@
-import nodemailer from 'nodemailer'
-import dns from 'node:dns/promises'
+import { Resend } from 'resend'
 
-const required = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'EMAIL_FROM']
-
-const isConfigured = () => required.every(name => Boolean(process.env[name]))
+const isConfigured = () => Boolean(process.env.RESEND_API_KEY)
 
 const sendEmail = async ({ to, subject, text, html }) => {
   if (!isConfigured()) throw new Error('Email provider is not configured')
 
-  const smtpHost = process.env.SMTP_HOST
-  const { address: smtpAddress } = await dns.lookup(smtpHost, { family: 4 })
-  const transporter = nodemailer.createTransport({
-    host: smtpAddress,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: process.env.SMTP_SECURE === 'true',
-    connectionTimeout: 15_000,
-    greetingTimeout: 15_000,
-    socketTimeout: 20_000,
-    tls: {
-      servername: smtpHost
-    },
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASSWORD
-    }
+  const resend = new Resend(process.env.RESEND_API_KEY)
+  const { data, error } = await resend.emails.send({
+    from: process.env.RESEND_FROM || 'CampusPulse <onboarding@resend.dev>',
+    to: [to],
+    subject,
+    text,
+    html
   })
 
-  await transporter.sendMail({ from: process.env.EMAIL_FROM, to, subject, text, html })
+  if (error) {
+    console.error('Resend email delivery failed:', error.message)
+    throw new Error(error.message)
+  }
+
+  console.info('OTP email sent via Resend:', data?.id || 'accepted')
 }
 
 export const emailService = {

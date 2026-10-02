@@ -65,7 +65,7 @@ OTP delivery is provider-backed and uses six-digit, five-minute codes with one-t
 
 Configure:
 
-- OTP delivery: email via SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`)
+- OTP delivery: Resend (`RESEND_API_KEY`, optional `RESEND_FROM`)
 
 Password recovery uses `/api/auth/forgot-password` followed by `/api/auth/reset-password` and returns generic request responses to avoid account enumeration.
 
