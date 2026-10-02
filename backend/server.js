@@ -95,6 +95,7 @@ const authRateLimit = rateLimit({
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  validate: false,
   message: { error: 'Too many authentication attempts. Try again shortly.' }
 })
 
@@ -1179,6 +1180,7 @@ app.put('/api/complaints/:id/status', auth, admin, async (req, res) => {
 })
 
 app.use((error, req, res, next) => {
+  console.error('Unhandled request error:', error.message)
   res.status(500).json({
     error: 'Server error'
   })
