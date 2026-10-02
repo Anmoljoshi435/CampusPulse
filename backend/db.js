@@ -7,6 +7,7 @@ export const pool = mysql.createPool({
   user: config.db.user,
   password: config.db.password,
   database: config.db.name,
+  ssl: config.nodeEnv === 'production' ? { rejectUnauthorized: false } : undefined,
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
   queueLimit: Number(process.env.DB_QUEUE_LIMIT || 0),
