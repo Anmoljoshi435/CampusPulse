@@ -1,43 +1,101 @@
 # CampusPulse
 
-CampusPulse is split into an independent React frontend and Node/Express backend.
+CampusPulse is a React/Vite frontend backed by an Express, MySQL, and Socket.IO API. Complaint classification and similarity analysis run through the Python AI service.
 
-## Structure
+## Deployed application
 
-- `frontend/` React + Vite dashboard
-- `backend/` Express API, JWT auth, MySQL queries, Socket.IO
-- `backend/database/` MySQL schema and seed data
-- `backend/ai/` Python TF-IDF-style cosine similarity analyzer
+- Frontend: https://campus-pulse-roan.vercel.app
+- API: https://campuspulse-api-tkh3.onrender.com
+- API health: https://campuspulse-api-tkh3.onrender.com/api/health
 
-## Run
+## Architecture
 
-1. Copy `backend/.env.example` to `backend/.env` and set the MySQL password and JWT secret.
-2. Create tables with `cd backend; npm run setup-db`
-3. Seed demo users with `npm run seed-db`
-4. Install frontend: `cd frontend; npm install`
-5. Install backend: `cd ../backend; npm install`
-6. Start backend: `npm run dev`
-7. In another terminal start frontend: `cd ../frontend; npm run dev`
+- `frontend/` - responsive React application
+- `backend/` - Express API, bcrypt authentication, MySQL access, Socket.IO
+- `backend/database/` - canonical schema, seed data, and versioned migrations
+- `backend/ai/` - TF-IDF similarity/classification implementation and optional HTTP service
 
-Backend health check: `http://localhost:5000/api/health`
+## Prerequisites
 
-Demo seed accounts use `student@campuspulse.local` and `admin@campuspulse.local`. Change seed passwords before production use.
+- Node.js 22+
+- MySQL 8+
+- Python 3.12+ for local AI execution
+- SMTP credentials for email OTP delivery
 
-Each college has a row in `colleges` with its own code. The seeded Cambridge Institute of Technology community uses `CIT001`; students enter that code and the college password `college123`, then wait for an admin approval request. Admin sign-in uses the college code plus `ADMIN_ACCESS_KEY` (`12345678`) and does not require approval. Admins can review requests with `GET /api/admin/requests` and approve them with `PUT /api/admin/requests/:id`.
+## Local setup
 
-The frontend requests browser geolocation and uses Open-Meteo for current temperature. If permission is denied or the weather service is unavailable, it displays that state instead of invented data.
+```powershell
+Copy-Item backend\.env.development.example backend\.env
+Copy-Item frontend\.env.development.example frontend\.env
+Set-Location backend
+npm ci
+npm run setup-db
+npm run db:migrate
+npm run db:seed
+Set-Location ..\frontend
+npm ci
+```
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Set a random `JWT_SECRET` of at least 32 characters and database credentials before starting the backend. Real OTP delivery requires SMTP credentials; the application never fabricates successful delivery.
 
-Currently, two official plugins are available:
+Start services in separate terminals:
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```powershell
+Set-Location backend; npm run dev
+Set-Location frontend; npm run dev
+```
 
-## React Compiler
+The Vite development proxy forwards `/api` and Socket.IO traffic to the backend. Production builds must define `VITE_API_URL` and `VITE_SOCKET_URL`.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Database
 
-## Expanding the Oxlint configuration
+Normal server startup does not mutate the schema. Apply migrations explicitly:
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+```powershell
+Set-Location backend
+npm run db:migrate
+npm run db:seed
+```
+
+`db:seed` is for development/demo data only. Do not use it against a production database without reviewing the SQL.
+
+## OTP and password recovery
+
+OTP delivery is provider-backed and uses six-digit, five-minute codes with one-time use, five attempts, and a sixty-second resend cooldown. OTP hashes are stored, never plaintext codes.
+
+Configure:
+
+- OTP delivery: Resend (`RESEND_API_KEY`, optional `RESEND_FROM`)
+
+Password recovery uses `/api/auth/forgot-password` followed by `/api/auth/reset-password` and returns generic request responses to avoid account enumeration.
+
+## AI service
+
+The backend uses the local Python process when `AI_SERVICE_URL` is empty. For an isolated service:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r backend\requirements.txt
+python backend\ai\service.py
+```
+
+Set `AI_SERVICE_URL` to the running service. AI failures do not block complaint creation; the API stores a safe default classification.
+
+## Production requirements
+
+- Set `NODE_ENV=production`, `CLIENT_URL`, `CORS_ORIGINS`, database settings, `JWT_SECRET`, `PYTHON_BIN`, and `AI_SERVICE_URL`.
+- Use HTTPS and secure infrastructure for the API, frontend, database, and SMTP provider.
+- Restrict CORS to known frontend origins.
+- Run migrations as a release step, not during API startup.
+- Use a long-running Node process for Socket.IO; do not deploy the realtime API as a serverless function.
+- Keep `.env` files, `node_modules`, `dist`, Python caches, logs, and credentials out of version control.
+
+## CI and verification
+
+GitHub Actions runs frontend install/lint/build, backend syntax checks, and Python compilation. Local checks:
+
+```powershell
+Set-Location frontend; npm ci; npm run lint; npm run build
+Set-Location ..\backend; npm ci; node --check server.js; node --check db.js
+python -m py_compile backend\ai\analyze.py backend\ai\service.py
+```
