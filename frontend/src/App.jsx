@@ -53,7 +53,12 @@ function CampusPulseApp() {
       const data = contentType.includes('application/json') ? await response.json() : { error: `The API returned an unexpected response (${response.status}). Start the backend on port 5000 and try again.` }
       if (!response.ok) throw new Error(data.error || 'Authentication failed')
       if (authMode === 'register') { setRegistrationChallenge({ ...data, email: payload.email }); setAuthMode('verify-registration'); } else { setSession(data) }
-    } catch (error) { setAuthError(error.message === 'Failed to fetch' ? 'Backend unavailable. Start the server on port 5000.' : error.message) } finally { setAuthBusy(false) }
+    } catch (error) {
+      const unavailableMessage = import.meta.env.DEV
+        ? 'Backend unavailable. Start the server on port 5000.'
+        : 'CampusPulse service is temporarily unavailable. Please try again.'
+      setAuthError(error.message === 'Failed to fetch' ? unavailableMessage : error.message)
+    } finally { setAuthBusy(false) }
   }
 
   const location = useLocation(); const navigate = useNavigate();
