@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer'
+import dns from 'node:dns/promises'
 
 const required = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'EMAIL_FROM']
 
@@ -7,14 +8,18 @@ const isConfigured = () => required.every(name => Boolean(process.env[name]))
 const sendEmail = async ({ to, subject, text, html }) => {
   if (!isConfigured()) throw new Error('Email provider is not configured')
 
+  const smtpHost = process.env.SMTP_HOST
+  const { address: smtpAddress } = await dns.lookup(smtpHost, { family: 4 })
   const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host: smtpAddress,
     port: Number(process.env.SMTP_PORT || 587),
     secure: process.env.SMTP_SECURE === 'true',
-    family: 4,
     connectionTimeout: 15_000,
     greetingTimeout: 15_000,
     socketTimeout: 20_000,
+    tls: {
+      servername: smtpHost
+    },
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASSWORD
