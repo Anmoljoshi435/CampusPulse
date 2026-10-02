@@ -96,6 +96,7 @@ const authRateLimit = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   validate: false,
+  keyGenerator: req => req.get('CF-Connecting-IP') || req.ip || 'unknown',
   message: { error: 'Too many authentication attempts. Try again shortly.' }
 })
 
